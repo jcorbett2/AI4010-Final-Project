@@ -1,10 +1,12 @@
-"""Generate and execute a Leaf Classification baseline experiment."""
+"""Run a Leaf Classification baseline and an LLM-driven revision."""
 
 import argparse
 import json
 import math
 import os
 from pathlib import Path
+import shutil
+import signal
 import subprocess
 import sys
 from urllib.error import HTTPError, URLError
@@ -16,9 +18,13 @@ from inspect_data import inspect_leaves
 PROJECT = Path(__file__).resolve().parent
 
 
-def generate_script(model, key, prompt):
+def generate_script(model, key, prompt, *, provider="openai"):
+    endpoint = {
+        "openai": "https://api.openai.com/v1/chat/completions",
+        "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    }[provider]
     request = Request(
-        "https://api.openai.com/v1/chat/completions",
+        endpoint,
         data=json.dumps({
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
@@ -40,26 +46,47 @@ def run_experiment(output, data, manifest, source):
     script = output / "train.py"
     script.write_text(source, encoding="utf-8")
     compile(source, str(script), "exec")
-    command = [
-        sys.executable, "-B", str(script), "--data", str(data), "--manifest", str(manifest),
-    ]
+    python = [sys.executable, "-X", "faulthandler", "-B"]
+    arguments = ["--data", str(data), "--manifest", str(manifest)]
+    command = [*python, str(script), *arguments]
     env = {"PATH": os.defpath, "PYTHONPATH": str(PROJECT)}
-    with (output / "training.log").open("w", encoding="utf-8") as log:
-        subprocess.run(
-            command, cwd=output, env=env, stdout=log, stderr=subprocess.STDOUT,
-            check=True, timeout=900,
-        )
     log_path = output / "training.log"
+    for attempt in range(2):
+        try:
+            with log_path.open("w", encoding="utf-8") as log:
+                subprocess.run(
+                    command, cwd=output, env=env, stdout=log, stderr=subprocess.STDOUT,
+                    check=True, timeout=900,
+                )
+            break
+        except subprocess.CalledProcessError as error:
+            if attempt or error.returncode != -signal.SIGSEGV:
+                raise
+            log_path.rename(output / "training-attempt-1.log")
+            (output / "model.pt").unlink(missing_ok=True)
+            # Try the standard CPU kernels if the optimized backend crashed.
+            command = [
+                *python, "-c",
+                "import runpy, sys, torch; "
+                "torch.backends.mkldnn.enabled = False; "
+                "sys.argv.pop(0); runpy.run_path(sys.argv[0], run_name='__main__')",
+                str(script), *arguments,
+            ]
     lines = log_path.read_text(encoding="utf-8").splitlines()
     if not lines:
         raise ValueError("Training produced no output.")
     metrics = json.loads(lines[-1])
-    accuracy = metrics.get("validation_accuracy") if isinstance(metrics, dict) else None
-    if type(accuracy) not in (float, int) or not math.isfinite(accuracy) or not 0 <= accuracy <= 1:
-        raise ValueError("Training did not report a valid validation_accuracy.")
+    accuracy = validation_accuracy(metrics)
     if not (output / "model.pt").is_file():
         raise ValueError("Training did not save model.pt.")
     (output / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
+    return accuracy
+
+
+def validation_accuracy(metrics):
+    accuracy = metrics.get("validation_accuracy") if isinstance(metrics, dict) else None
+    if type(accuracy) not in (float, int) or not math.isfinite(accuracy) or not 0 <= accuracy <= 1:
+        raise ValueError("Training did not report a valid validation_accuracy.")
     return accuracy
 
 
@@ -69,11 +96,18 @@ def main():
     parser.add_argument("--manifest", type=Path, default=PROJECT / "splits.json")
     parser.add_argument("--output", required=True, type=Path, help="New directory for run artifacts")
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--model", help="OpenAI API model whose generated Python will be run locally")
+    mode.add_argument("--model", help="API model whose generated Python will be run locally")
     mode.add_argument("--offline", action="store_true", help="Run the reference script without an LLM")
+    parser.add_argument("--provider", choices=("openai", "gemini"), default="openai")
+    initial = parser.add_mutually_exclusive_group()
+    initial.add_argument("--initial-script", type=Path, help="Replay a saved initial training script before requesting a revision")
+    initial.add_argument("--initial-run", type=Path, help="Reuse a completed initial run for the same dataset and split manifest")
     args = parser.parse_args()
-    if args.model and not (key := os.getenv("OPENAI_API_KEY")):
-        parser.error("Set OPENAI_API_KEY to run with --model.")
+    if (args.initial_script or args.initial_run) and not args.model:
+        parser.error("--initial-script and --initial-run require --model.")
+    key_name = {"openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY"}[args.provider]
+    if args.model and not (key := os.getenv(key_name)):
+        parser.error(f"Set {key_name} to run with --model.")
 
     data, manifest, output = args.data.resolve(), args.manifest.resolve(), args.output.resolve()
     try:
@@ -101,21 +135,59 @@ Reference:
         (output / "run.json").write_text(json.dumps({
             "mode": "offline" if args.offline else "llm",
             "model": args.model,
+            "provider": args.provider if args.model else None,
             "data": str(data),
             "manifest": str(manifest),
             "inspection": summary,
+            "initial_script": str(args.initial_script.resolve()) if args.initial_script else None,
+            "initial_run": str(args.initial_run.resolve()) if args.initial_run else None,
         }, indent=2) + "\n", encoding="utf-8")
-        if args.offline:
+        if args.initial_run:
+            source = (args.initial_run / "train.py").read_text(encoding="utf-8")
+            metrics = json.loads((args.initial_run / "metrics.json").read_text(encoding="utf-8"))
+            accuracy = validation_accuracy(metrics)
+            if metrics.get("validation_examples") != len(splits["validation"]):
+                raise ValueError("Saved run has a different number of validation examples.")
+            for name in ("train.py", "metrics.json", "training.log", "model.pt"):
+                shutil.copyfile(args.initial_run / name, output / name)
+        elif args.offline:
             source = reference
         else:
             (output / "prompt.txt").write_text(prompt, encoding="utf-8")
-            source = generate_script(args.model, key, prompt)
-        accuracy = run_experiment(output, data, manifest, source)
+            if args.initial_script:
+                source = args.initial_script.read_text(encoding="utf-8")
+            else:
+                source = generate_script(args.model, key, prompt, provider=args.provider)
+        if not args.initial_run:
+            accuracy = run_experiment(output, data, manifest, source)
+        print(f"Initial validation accuracy: {accuracy:.2%}")
+        if args.model:
+            revision = output / "revision"
+            revision.mkdir()
+            feedback = (output / "metrics.json").read_text(encoding="utf-8")
+            revision_prompt = f"""{prompt}
+
+The initial experiment completed. Its measured validation feedback was:
+{feedback}
+
+Here is the actual initial training code:
+{source}
+
+Use the observed feedback to choose one concrete change intended to improve
+validation accuracy. Keep the same dataset splits and compute budget.
+Return the complete revised Python script. Start it with a Python comment
+explaining what the metrics showed, what you changed, and why.
+"""
+            (revision / "prompt.txt").write_text(revision_prompt, encoding="utf-8")
+            revised_source = generate_script(
+                args.model, key, revision_prompt, provider=args.provider,
+            )
+            revised_accuracy = run_experiment(revision, data, manifest, revised_source)
+            print(f"Revised validation accuracy: {revised_accuracy:.2%}")
     except HTTPError as error:
         parser.exit(1, f"Model API request failed (HTTP {error.code}).\n")
     except (OSError, URLError, ValueError, KeyError, SyntaxError, subprocess.SubprocessError) as error:
         parser.exit(1, f"Experiment failed: {error}\nRun artifacts: {output}\n")
-    print(f"Validation accuracy: {accuracy:.2%}")
     print(f"Run artifacts: {output}")
 
 
