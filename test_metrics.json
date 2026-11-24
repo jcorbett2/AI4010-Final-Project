@@ -1,0 +1,13 @@
+{
+  "split": "test",
+  "leaves": {
+    "examples": 99,
+    "correct": 34,
+    "accuracy": 0.3434343434343434
+  },
+  "documents": {
+    "examples": 14,
+    "pixels": 2912760,
+    "rmse": 0.1785274042354663
+  }
+}
